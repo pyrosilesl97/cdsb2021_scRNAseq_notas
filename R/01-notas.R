@@ -15,4 +15,4 @@
 #entre arquitecturas y así sea posible instalar librerías diseñadas para intel.
 
 
-Uso del booleano %in% int_gen
+#Uso del booleano %in% int_gen
