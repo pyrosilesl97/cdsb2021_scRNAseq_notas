@@ -264,6 +264,8 @@ Se deben obtener estimados de los componentes biológico y técnico para cada ge
 ```{r echo=FALSE, fig.cap="Factor experimental.", out.width = "100%"}
 knitr::include_graphics("img/experimental-factor.png")
 ```
+
+
 ## Seleccionando genes altamante variables (high-variable genes, HVGs)
 Hasta ahora hemos ordenado los genes del más al menos **interesantemente variable**
 *¿Qué tanto debemos de bajar en la lista para seleccionar nuestros HVGs?*
@@ -272,6 +274,10 @@ Para responder esta pregunta debemos tomar en cuenta lo siguiente: elegir un sub
 - Incrementa el ruido por la inclusión de genes irrelevantes
 Es difícil determinar el balance óptimo porque el rudio en un contexto podría ser una señal útil en otro contexto
 Discutiremos algunas estrategias para seleccionar HVGs
+
+
+
+
 ### Seleccionando HVGs sobre la métrica de varianza
 La estrategia más simple es seleccionar los **top-X genes** con los valores más grandes para la métrica relevante de varianza, *por ejemplo, la varianza biológica más grande calculada con `scran::modelGeneVar()`*
 **Pro**: El usuario puede controlar directamente el número de HVGs
@@ -318,6 +324,9 @@ hvg.pbmc.cv2.2 <- getTopHVGs(dec.cv2.pbmc,
 )
 str(hvg.pbmc.cv2.2)
 ```
+
+
+
 ### Seleccionando genes por arriba de la tendencia media-varianza
 Selecciona todos los genes con **una varianza biológica positiva**
 Este es un extremo del equilibrio sesgo-varianza que minimiza el sesgo con el costo de maximizar el ruido
@@ -338,8 +347,46 @@ str(hvg.pbmc.var.3)
 hvg.pbmc.cv2.3 <- getTopHVGs(dec.cv2.pbmc,
     var.field = "ratio", var.threshold = 1
 )
-str(hvg.pbmc.cv2.2)
+str(hvg.pbmc.cv2.3)
 ```
+#En este caso, todos los pasos posteriores son más lentos. 
+
+```{r}
+# Visualicemos la relación con la media
+fit.cv2.pbmc <- metadata(dec.cv2.pbmc)
+
+a <- fit.cv2.pbmc$mean[row.names(data.frame(fit.cv2.pbmc$cv2))%in%hvg.pbmc.cv2]
+
+b <- fit.cv2.pbmc$cv2[row.names(data.frame(fit.cv2.pbmc$cv2))%in%hvg.pbmc.cv2]
+
+
+plot(fit.cv2.pbmc$mean, fit.cv2.pbmc$cv2,
+    log = "xy",group_by='fit.cv2.pbmc'
+)
+curve(fit.cv2.pbmc$trend(x),
+    col = "dodgerblue",
+    add = TRUE, lwd = 2
+)
+points(fit.cv2.pbmc$mean[hvg.pbmc.cv2], fit.cv2.pbmc$cv2[hvg.pbmc.cv2])
+## Así lo hice, pero era un vector nombrado, entonces no había problema con pedirlos directamente
+
+#points(a, b,col='red')
+
+
+
+
+
+
+
+
+
+datos <- data.frame(fit.cv2.pbmc$cv2)
+datos <- data.frame(row.names(datos),fit.cv2.pbmc$mean,fit.cv2.pbmc$cv2)
+
+datos_grafica <- datos[hvg.pbmc.cv2%in%datos$row.names.datos.,]
+```
+
+
 ### Seleccionando genes de interés *a priori*
 Una estrategia contundente es usar sets predefinidos de genes de interés. No hay vergüenza en aprovechar el conocimiento biológivo previo
 Sin embargo, limita nuestra capacidad de descubrir aspectos nuevos o inesperados de la variación. Por lo tanto, considera esta como una estrategia complementaria a otros tipo de estrategias de selección de HGVs
@@ -377,6 +424,9 @@ sce.pbmc
 Mantiene el objeto *SingleCellExperiment* original y especifica los genes para usar en funciones posteriores mediante un argumento adicional como **subset_row**
 **PRO:** Es útil si el análisis usa varios conjuntos de HGVs en diferentes pasos
 **CONTRA:** Podría ser inconveniente especificar repetidamente el mismo conjunto de HGVs en diferentes pasos
+
+
+
 ### Witchcraft (Brujería)
 ```{r }
 # Add the full SCE to the subsetted data SCE
@@ -387,6 +437,11 @@ altExp(sce.pbmc.hvg, "original")
 Utilizando el sistema de "experimento alternartivo" en la clase *SingleCellExperiment*
 **PRO:** Evita algunos problemas a largo plazo cuando el dataset original no está sincronizado con el conjunto filtrado por HVGs
 **CONTRA:** Ralentiza todos los análisis subsecuentes
+
+
+
+
+
 ## Resumen y recomendaciones
 * Es fácil atorarse en este paso debido a la variedad de opciones disponibles
 * Elige un conjunto de HVGs y continúa con el análisis, **recuerda regresar para probar la robustez de tus resultados usando una forma diferente para seleccionar los HVGs**
