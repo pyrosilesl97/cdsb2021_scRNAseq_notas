@@ -37,6 +37,11 @@ options(prompt = "🦖 ~ 🧬 >")
 starwarssay::say("Join the dark side.... #CODE \n Welcome back Pablo", by = "darth_vader")
 
 usethis::edit_r_profile()
+starwarssay::say("Be a Jedi", by = "yoda")
+
+
+
+
 if (interactive()) {
   .First <- function() {
     # aquí van los mensajes o las funciones para la bienvenida

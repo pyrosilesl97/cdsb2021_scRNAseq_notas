@@ -398,7 +398,7 @@ plotExpression(sce.pbmc,
 
 ```{r, warning=FALSE, message=FALSE}
 # Repeating modelling and PCA on the subset of cells we have
-# identified as memory T-cells (cluster 6).
+# identified as memory T-cells (cluster 10).
 memory <- 10
 sce.memory <- sce.pbmc[, clust.full == memory]
 dec.memory <- modelGeneVar(sce.memory)
