@@ -1,0 +1,630 @@
+---
+title: "Análisis de expresión diferencial"
+author: "Pablo Yamild Rosiles Loeza"
+date: "8/13/2021"
+output: html_document
+---
+# Análisis de expresión diferencial
+
+Instructor: [Leonardo Collado Torres](https://comunidadbioinfo.github.io/es/authors/lcollado/)
+
+```{r cargar_paquetes, message = FALSE}
+## Paquetes de este capítulo
+library("MouseGastrulationData") ## para descargar datos de ejemplo
+library("scater") ## para gráficas y control de calidad
+library("scran") ## para selección de genes, clustering, etc
+library("batchelor") ## para métodos de correción de batch (lote)
+library("patchwork") ## para agrupar gráficas
+library("Polychrome") ## para muchos colores
+library("bluster") ## métodos de clustering
+library("edgeR") ## para expresión diferencial
+```
+
+## Diapositivas de Peter Hickey
+
+Ve las diapositivas [aquí](https://docs.google.com/presentation/d/1CRTE_1m8YHf8p6GMl-rbBpyOx2KS4UxdTC1dpvVgKEs/edit?usp=sharing).
+
+Esas diapositivas están basadas en este [capítulo de OSCA](https://bioconductor.org/books/release/OSCA/multi-sample-comparisons.html). El libro de OSCA tiene algunas partes más actualizadas de lo que vienen en las diapositivas.
+
+## Motivación
+
+* 👉 scRNA-seq nos puede ayudar a estudiar cambios en composición (cambios en proporciones de células) o cambios en niveles de expresión de genes entre varias condiciones biológicas
+  - El primero se llama cambios de abundancia,
+  - Ejemplo: [después de un tratamiento con una droga](https://www.ncbi.nlm.nih.gov/pubmed/30013148)
+  - Ejemplo: [después de modificaciones genéticas](https://www.ncbi.nlm.nih.gov/pubmed/27383781)
+* 👉 Nos permite obtener mayor resolución biológica que experimentos convencionales de RNA-seq, sobre todo si podemos asociar cambios en poblaciones celulares a manipulaciones experimentales
+
+### Dos categorías de análisis
+
+* 👉 Análisis de expresión diferencial
+  - Buscamos cambios en niveles de expresión entre condiciones para células del mismo tipo que están presentes en todas las condiciones
+* 👉 Análisis de abundancia diferencial
+  - Buscamos cambios en la composición de los tipos celulares entre condiciones
+  - Podría ser entre estados celulares en vez de tipos celulares
+  
+**Son dos lados de la misma moneda**
+
+#### Expresión diferencial
+
+```{r, echo = FALSE}
+set.seed(20210811)
+knitr::kable(data.frame(
+    gene = paste0("gene", rep(rep(1:2, each = 2), 2)),
+    condición = paste0("grupo", rep(rep(1:2, 2), 2)),
+    celula = paste0("celula", rep(1:2, each = 4)),
+    expresión = round(rnorm(8, mean = 10, sd = 2), 2)
+))
+```
+
+#### Abundancia diferencial
+
+```{r, echo = FALSE}
+set.seed(20210811)
+knitr::kable(data.frame(
+    condición = paste0("grupo", rep(1:2, 2)),
+    celula = paste0("celula", rep(1:2, each = 2)),
+    frecuencia = round(rnorm(4, mean = 40, sd = 4), 0)
+))
+```
+
+## Datos de ejemplo
+
+Embriones de ratón quiméricos. 
+
+> * Chimeric E8.5 mouse embryos
+>   - td-Tomato+ ESCs injected into WT blastocyst
+>   - No genetic differences between the injected and background cells (except expression of td-Tomato in the former)
+> * 3 replicate batches
+>   - Each batch contains td-Tomato+ and td-Tomato- cells sorted from a single pool of dissociated cells from 6-7 chimeric embryos
+>   - 2,000 - 7,000 cells/sample using 10X Genomics
+> * Aim is to determine whether the injection procedure itself introduces differences in lineage commitment compared to the background cells
+https://bioconductor.org/books/release/OSCA/pijuan-sala-chimeric-mouse-embryo-10x-genomics.html
+
+_Pijuan-Sala, B. et al. A single-cell molecular map of mouse gastrulation and early organogenesis. Nature 566, 490–495 (2019)._
+
+### Descarguemos los datos de ejemplo
+
+```{r, message = FALSE}
+#--- loading ---#
+library("MouseGastrulationData")
+sce.chimera <- WTChimeraData(samples = 5:10)
+```
+
+
+```{r}
+## Exploremos los datos
+sapply(colData(sce.chimera)[, -(1:2)], function(x) {
+    x <- if (is.character(x) || is.integer(x)) factor(x) else x
+    summary(x)
+})
+```
+
+Básicamente:
+
+* `sample`: 6 ratones diferentes
+* `tomato`: inyectados o no con td-Tomato
+* `pool`: lote de secuenciación, cada lote con 1 con y otro sin inyección
+* `celltype.mappped`: 35 tipos de células anotados
+
+```{r}
+## Número de células en nuestras variables principales
+with(colData(sce.chimera), table(sample, pool, tomato))
+## Número de tipos celulares
+length(unique(sce.chimera$celltype.mapped))
+```
+
+
+### Procesamiento
+
+* Usaremos los métodos que ya vimos para procesar datos
+
+* Usaremos `batchelor` porque tenemos muestras de 3 lotes de muestras y queremos eliminar diferencias entre los lotes
+
+* Para más detalles, revisar https://bioconductor.org/books/release/OSCA/integrating-datasets.html
+
+```{r}
+#--- feature-annotation ---#
+library("scater")
+rownames(sce.chimera) <- uniquifyFeatureNames(
+    rowData(sce.chimera)$ENSEMBL, rowData(sce.chimera)$SYMBOL
+)
+#--- quality-control ---#
+drop <- sce.chimera$celltype.mapped %in% c("stripped", "Doublet")
+sce.chimera <- sce.chimera[, !drop]
+#--- normalization ---#
+sce.chimera <- logNormCounts(sce.chimera)
+#--- variance-modelling ---#
+library("scran")
+dec.chimera <- modelGeneVar(sce.chimera, block = sce.chimera$sample)
+chosen.hvgs <- dec.chimera$bio > 0
+#--- merging ---#
+library("batchelor")
+set.seed(01001001)
+merged <- correctExperiments(sce.chimera,
+    batch = sce.chimera$sample,
+    subset.row = chosen.hvgs,
+    PARAM = FastMnnParam(
+        merge.order = list(
+            list(1, 3, 5), # WT (3 replicates)
+            list(2, 4, 6) # td-Tomato (3 replicates)
+        )
+    )
+)
+#--- clustering ---#
+g <- buildSNNGraph(merged, use.dimred = "corrected")
+clusters <- igraph::cluster_louvain(g)
+colLabels(merged) <- factor(clusters$membership)
+#--- dimensionality-reduction ---#
+merged <- runTSNE(merged, dimred = "corrected", external_neighbors = TRUE)
+merged <- runUMAP(merged, dimred = "corrected", external_neighbors = TRUE)
+```
+
+### Exploremos los datos de ejemplo
+
+* Exploremos si tenemos clusters con una diferencia grande en el número de celulas entre las muestras sin y con inyecciones de td-Tomato
+
+* Exploremos el número de células en cada cluster a lo largo de los 3 lotes de secuenciación (batch)
+
+```{r}
+## Clusters vs DE por td-Tomato
+table(colLabels(merged), merged$tomato)
+## Clusters vs lotes de muestras (batch)
+table(colLabels(merged), merged$pool)
+```
+
+* Visualizaremos nuestros clusters que son `r length(unique(merged$label))` en dimensiones reducidas de t-SNE
+  - Queremos que todos los clusters tengan muestras de cada lote de secuenciación (batch). Detalles en [OSCA](https://bioconductor.org/books/release/OSCA/integrating-datasets.html)
+  - Vemos que no parece que haya mucha señal en base a td-Tomato
+  
+```{r, fig.width=10}
+library("patchwork")
+plotTSNE(merged, colour_by = "tomato", text_by = "label") +
+    plotTSNE(merged, colour_by = data.frame(pool = factor(merged$pool)))
+```
+
+### Nuestros clusters vs los originales
+
+* Las siguientes gráficas nos ayudan a comparar nuestros clusters vs los que encontraron en el estudio original
+
+* ¿Les parecen similares?
+
+```{r, fig.width=10, warning = FALSE}
+## Definir colores, si no scater nos los pone en una escala
+## continua
+cols_label <- Polychrome::palette36.colors(length(unique(merged$label)))
+names(cols_label) <- unique(merged$label)
+cols_celltype.mapped <- Polychrome::palette36.colors(length(unique(merged$celltype.mapped)))
+names(cols_celltype.mapped) <- unique(merged$celltype.mapped)
+## Nuestros clusters vs anotación de células por los
+## autores originales
+plotTSNE(merged, colour_by = "label", text_by = "label") +
+    theme(legend.position = "none") +
+    scale_colour_manual(values = cols_label) +
+    plotTSNE(merged, colour_by = "celltype.mapped") +
+    theme(legend.position = "none") +
+    scale_colour_manual(values = cols_celltype.mapped)
+```
+
+* Es difícil el proceso de comparar clusters
+
+* Podemos usar `bluster` para evaluar númericamente que tanto se parecen los clusters. Entre más cerca de 1, mejor en `pairwiseRand()`
+
+* También podemos hacer un heatmap
+
+```{r}
+library("bluster")
+pairwiseRand(colLabels(merged), merged$celltype.mapped, "index")
+by.label <- table(colLabels(merged), merged$celltype.mapped)
+pheatmap::pheatmap(log2(by.label + 1), color = viridis::viridis(101))
+```
+
+* Por eso es más fácil combinar datos de varios lotes de secuenciación y hacer un solo clustering en vez de varios y tener que identificar que clusters de una muestra corresponden a los de otra
+
+* ⚠️ Nos saltaremos el proceso de anotación de células y usaremos los clusters y etiquetas originales
+
+## Análisis de expresión diferencial
+
+* En RNA-seq estamos acostumbrados a evaluar si hay diferencias en los niveles de expresión de genes entre condiciones, así que es natural que lo hagamos con scRNA-seq también
+
+* 🤔 Pero los datos de scRNA-seq tienen muchos ceros 
+
+
+### Pseudo-bulking
+
+* El proceso de _pseudo-bulking_ es un truco que nos permite usar métodos de bulk RNA-seq para analizar nuestros datos de scRNA-seq
+
+* Cómo tenemos muchas células de cada condición, para cada gene podemos sumar los niveles de expresión entre todas las células de esa condición
+
+<blockquote class="twitter-tweet"><p lang="en" dir="ltr">🔥off the press! 👀 our <a href="https://twitter.com/biorxivpreprint?ref_src=twsrc%5Etfw">@biorxivpreprint</a> on human 🧠brain <a href="https://twitter.com/LieberInstitute?ref_src=twsrc%5Etfw">@LieberInstitute</a> spatial 🌌🔬transcriptomics data 🧬using Visium <a href="https://twitter.com/10xGenomics?ref_src=twsrc%5Etfw">@10xGenomics</a>🎉<a href="https://twitter.com/hashtag/spatialLIBD?src=hash&amp;ref_src=twsrc%5Etfw">#spatialLIBD</a><br><br>🔍<a href="https://t.co/RTW0VscUKR">https://t.co/RTW0VscUKR</a> <br>👩🏾‍💻<a href="https://t.co/bsg04XKONr">https://t.co/bsg04XKONr</a><br>📚<a href="https://t.co/FJDOOzrAJ6">https://t.co/FJDOOzrAJ6</a><br>📦<a href="https://t.co/Au5jwADGhY">https://t.co/Au5jwADGhY</a><a href="https://t.co/PiWEDN9q2N">https://t.co/PiWEDN9q2N</a> <a href="https://t.co/aWy0yLlR50">pic.twitter.com/aWy0yLlR50</a></p>&mdash; 🇲🇽 Leonardo Collado-Torres (@lcolladotor) <a href="https://twitter.com/lcolladotor/status/1233661576433061888?ref_src=twsrc%5Etfw">February 29, 2020</a></blockquote> <script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
+
+* Ejemplo de mi trabajo:
+  - 12 muestras
+  - 7 regiones
+  - 47,681 _spots_ (digamos que células)
+
+<script async class="speakerdeck-embed" data-slide="10" data-id="dde92cd6dfc04f9589770e074915658f" data-ratio="1.33333333333333" src="//speakerdeck.com/assets/embed.js"></script>
+
+* Podemos _comprimir_ la información a una matriz de 12 * 7 = 84 columnas
+
+* Nos quedamos con pocas _réplicas_ para nuestro análisis, pero justamente los métodos de bulk RNA-seq están diseñados para esos escenarios (claro, entre más datos mejor!!!)
+
+* Acá pueden explorar los datos si quieren http://spatial.libd.org/spatialLIBD/
+
+Estas diapositivas son parte de un webinar que di con [Kristen R Maynard](https://twitter.com/kr_maynard) el 2021-04-27 para BioTuring que pueden ver [desde su sitio web](https://bioturing.com/sources/webinar/60752954a433e26dd8affcbd) o en YouTube.
+
+<iframe width="560" height="315" src="https://www.youtube.com/embed/S8884Kde-1U" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+
+
+* Podemos hacerlo manualmente o de forma más sencilla con la función `aggregateAcrossCells()`
+
+
+```{r}
+# Using 'label' and 'sample' as our two factors; each column of the output
+# corresponds to one unique combination of these two factors.
+summed <- aggregateAcrossCells(merged,
+    id = colData(merged)[, c("celltype.mapped", "sample")]
+)
+summed
+dim(merged)
+dim(summed)
+with(colData(merged), length(unique(celltype.mapped)) * length(unique(sample)))
+```
+
+* En teoría podríamos tener más columnas, pero no las tenemos todas porque no tenemos datos para todas las combinaciones
+
+* Esto puede afectar nuestro análisis, y pues afecta cuantas variables podremos usar para ajustar
+  - Por ejemplo, si agregamos sexo con 2 opciones, duplicaríamos el número teórico de columnas pero tal vez no tengamos suficientes datos
+  - Si lo llevas al extremo, terminas con los mismos datos que con los que empezamos
+
+
+### Convertir a un objeto nuevo
+
+* Hagamos nuestro análisis de expresión diferencial
+
+* Empezaremos con solo un tipo celular: `Mesenchyme`
+
+```{r}
+label <- "Mesenchyme"
+current <- summed[, label == summed$celltype.mapped]
+dim(current)
+```
+
+* Vemos que nos quedamos con solo 14,699 genes a lo largo de 6 muestras
+  - Esto sería un experimento pequeño de bulk RNA-seq
+
+* Usaremos `edgeR` de [Robinson, McCarthy e Smyth, _Bioinformatics_, 2010](https://pubmed.ncbi.nlm.nih.gov/19910308/) que es uno de los paquetes más usados para análisis de expresión diferencial en bulk RNA-seq
+  - Aaron Lun, autor de OSCA, se formó por el mismo grupo en Australia
+
+```{r}
+# Creating up a DGEList object for use in edgeR:
+library("edgeR")
+y <- DGEList(counts(current), samples = colData(current))
+y
+```
+
+* Listo, ya convertimos nuestros datos al formato que le gusta a `edgeR`
+
+
+### Pre-procesamiento
+
+* Antes de poder continuar, vamos a eliminar _muestras_ que construimos con el proceso de _pseudo-bulking_ que no tengan al menos 10 células 
+
+```{r}
+discarded <- current$ncells < 10
+y <- y[, !discarded]
+summary(discarded)
+```
+
+* A continuación eliminaremos genes que tengan bajos nivels de expresión
+
+```{r}
+keep <- filterByExpr(y, group = current$tomato)
+y <- y[keep, ]
+summary(keep)
+```
+
+* Después normalizaremos los datos
+  - Pero si ya habíamos normalizado los datos de scRNA-seq, ¿qué pasó? ^[Empezamos de nuevo con las cuentas originales en `y <- DGEList(counts(current), samples=colData(current))` y no las normalizadas.]
+
+```{r}
+y <- calcNormFactors(y)
+y$samples
+```
+
+* `calcNormFactors()` asume que la mayoría de los genes no están diferencialmente expresados como describen [Robinson y Oshlack, _Genome Biol._, 2010](https://pubmed.ncbi.nlm.nih.gov/20196867/)
+
+* Podemos visualizar los cambios de expresión para todos los genes, una muestra a la vez
+
+```{r}
+par(mfrow = c(2, 3))
+for (i in seq_len(ncol(y))) {
+    plotMD(y, column = i)
+}
+```
+
+* Podemos usar técnicas de reducción de dimensiones como `MDS` y `PCA` para explorar la variación entre nuestras muestras (ya no células)
+
+```{r}
+par(mfrow = c(1, 1))
+plotMDS(cpm(y, log = TRUE),
+    col = ifelse(y$samples$tomato, "red", "blue")
+)
+```
+
+### Modelo estadístico
+
+* Si todo nos parece bien, podemos seguir con definir nuestro modelo estadístico
+
+* Vamos a ajustar por lote (batch) y encontrar diferencias por la inyección de td-Tomato
+  - Como empezamos con las cuentas desde cero, tenemos que tomar en cuenta la variación por lote de secuenciación
+
+```{r}
+design <- model.matrix(~ factor(pool) + factor(tomato), y$samples)
+design
+```
+
+* Si queremos explorar nuestro modelo estadístico de forma interactiva, podemos usar [`ExploreModelMatrix`](https://bioconductor.org/packages/ExploreModelMatrix) por [Charlotte Soneson](https://twitter.com/CSoneson) y [Michael Love](https://twitter.com/mikelove). Charlotte es de las autoras de `iSEE`.
+
+```{r}
+if (interactive()) {
+    ExploreModelMatrix::ExploreModelMatrix(y$samples[, c("pool", "tomato")], ~ factor(pool) + factor(tomato))
+}
+```
+
+* Tal y como en bulk RNA-seq, podemos usar la información de los genes para mejorar nuestros estimados de la varianza para cada gene, de tal forma que mejoramos los resultados estadísticos aunque tengamos pocas muestras
+
+```{r}
+y <- estimateDisp(y, design)
+summary(y$trended.dispersion)
+plotBCV(y)
+fit <- glmQLFit(y, design, robust = TRUE)
+summary(fit$var.prior)
+summary(fit$df.prior)
+plotQLDisp(fit)
+```
+
+* Ahora si podemos correr nuestro modelo estádistico
+
+```{r}
+res <- glmQLFTest(fit, coef = ncol(design))
+summary(decideTests(res))
+topTags(res)
+```
+
+* Encontramos 32 y 48 genes diferencialmente expresados por la inyección de td-Tomato.
+
+
+### De forma sencilla
+
+* Eso fue mucho trabajo, ¿no?
+
+* La función `pseudoBulkDGE()` corre todos esos pasos por nosotros
+
+```{r}
+# Removing all pseudo-bulk samples with 'insufficient' cells.
+summed.filt <- summed[, summed$ncells >= 10]
+library("scran")
+de.results <- pseudoBulkDGE(summed.filt,
+    label = summed.filt$celltype.mapped,
+    design = ~ factor(pool) + tomato,
+    coef = "tomatoTRUE",
+    condition = summed.filt$tomato
+)
+class(de.results)
+length(de.results)
+```
+
+* Nos regresa una lista con los resultados para cada uno de nuestros tipos celulares
+
+* Podemos extraer los resultados para nuestro tipo celular de interés, por ejemplo _Allantois_.
+
+```{r}
+cur.results <- de.results[["Allantois"]]
+cur.results[order(cur.results$PValue), ]
+y.allantois <- metadata(cur.results)$y
+plotBCV(y.allantois)
+```
+
+* También nos dice que tipos celulares fallaron porque no teníamos suficiente información para hacer el análisis
+
+```{r}
+metadata(de.results)$failed
+```
+
+* Aquí podemos hacer la misma gráfica que hicimos de forma manual para _Mesenchyme_.
+
+```{r}
+cur.results.Mesenchyme <- de.results[["Mesenchyme"]]
+y.Mesenchyme <- metadata(cur.results.Mesenchyme)$y
+plotBCV(y.Mesenchyme)
+```
+
+### Ejercicios
+
+#### Pseudo-bulking
+
+Hagamos el cálculo de pseudo-bulking de forma manual para la primera muestra de `summed` y el gene con los valores más altos de expresión para esa muestra. Es decir, trabajaremos con el siguiente gene.
+
+```{r}
+colData(summed)[1, ]
+which.max(counts(summed)[, 1])
+```
+
+Usa el objeto `merged` para volver a calcular el siguiente valor.
+
+```{r}
+counts(summed)[which.max(counts(summed)[, 1]), 1]
+```
+
+#### Visualización de resultados de expresión diferencial
+
+Usando los resultados de expresión diferencial para el tipo celular `Mesenchyme`, reproduce la siguiente visualización.
+
+```{r volcano, echo = FALSE}
+library("ggplot2")
+## class(cur.results.Mesenchyme)
+# [1] "DFrame"
+# attr(,"package")
+# [1] "S4Vectors"
+df <- as.data.frame(cur.results.Mesenchyme)
+df$label <- rownames(df)
+p <- ggplot(df,
+    aes(
+        x = logFC,
+        y = -log10(PValue),
+        color = FDR < 0.05,
+        label = label
+    )) + geom_point()
+p
+```
+
+* Explora la información que tenemos en `cur.results.Mesenchyme`.
+* Si usas el paquete `ggplot2`, tendrás que usar `as.data.frame()` para convertir un objeto `DFrame` a un `data.frame`.
+* Revisa que valores salen en cada eje y en los colores.
+* Tal vez algunos valores tiene alguna transformación.
+
+### Respuestas
+
+#### Pseudo-bulking
+
+```{r}
+## Valor esperado
+counts(summed)[which.max(counts(summed)[, 1]), 1]
+## Respuesta
+sum(counts(merged)[
+    names(which.max(counts(summed)[, 1])),
+    merged$celltype.mapped == "Allantois" & merged$sample == 5
+])
+## Otra versión
+sum(counts(merged)[
+    "Ptma",
+    with(colData(merged), celltype.mapped == "Allantois" & sample == 5)
+])
+```
+
+#### Visualización de resultados de expresión diferencial
+
+```{r}
+<<volcano>>
+```
+
+* Este tipo de gráfica es un _volcano plot_ donde vemos en el eje X el cambio de expresión y en el eje Y el valor p transformado con `-log10(p)`. Usamos colores para marcar los genes con un `FDR < 0.05`.
+
+#### Con etiquetas
+
+* Podemos agregarle etiquetas usando el paquete `ggrepel`.
+
+```{r}
+p + ggrepel::geom_text_repel(data = subset(df, FDR < 0.05))
+```
+
+#### Versión interactiva
+
+* O podemos hacer una versión interactiva con `plotly`.
+
+```{r}
+plotly::ggplotly(p)
+```
+
+## Análisis de abundancia diferencial
+
+```{r}
+table(merged$sample)
+```
+
+* Si recuerdan, tenemos 6 muestras en total. 
+
+* 👉 Otro tipo de análisis que podemos hacer es preguntarnos si cambió la composición celular entre nuestras muestras con y sin la inyección de td-Tomato.
+
+* 👉 Este tipo de análisis nos dirá que tipos celulares cambiaron de acuerdo a nuestras condiciones de interés, que puede ser igual de interesante que encontrar genes diferencialmente expresados.
+
+* 👉 Es como si scRNA-seq fuera un _super-FACS_ donde usamos todo el transcriptoma.
+
+* Hagamos una tabla de la frecuencia de cada tipo celular a lo largo de nuestras muestras. Es decir, una tabla de abundancias
+
+```{r}
+abundances <- table(merged$celltype.mapped, merged$sample)
+abundances <- unclass(abundances)
+head(abundances)
+```
+
+* A esta tabla le podemos agregar algo de información de nuestras muestras, y con eso construir un objeto del tipo que le gusta a `edgeR`
+
+```{r}
+# Attaching some column metadata.
+extra.info <- colData(merged)[match(colnames(abundances), merged$sample), ]
+y.ab <- DGEList(abundances, samples = extra.info)
+y.ab
+```
+
+* A diferencia de los análisis de expresión diferencial, no usaremos `calcNormFactors()` porque este tipo de análisis no cumple, generalmente, con las condiciones del método estadístico
+
+* A continuación filtramos los tipos celulares para los cuales no tenemos suficiente información, si es el caso
+
+```{r}
+keep <- filterByExpr(y.ab, group = y.ab$samples$tomato)
+y.ab <- y.ab[keep, ]
+summary(keep)
+```
+
+* Luego hacemos nuestro análisis de abundancia con `edgeR` el cual nos permite usar el modelo estadístico que está diseñado para valores enteros (cuentas) y pocas réplicas
+
+* Es la misma formúla del modelo estadístico (`design`) que usamos anteriormente, pero para otros números
+
+```{r}
+design <- model.matrix(~ factor(pool) + factor(tomato), y.ab$samples)
+design
+y.ab <- estimateDisp(y.ab, design, trend = "none")
+summary(y.ab$common.dispersion)
+plotBCV(y.ab, cex = 1)
+```
+
+* A diferencia de antes, tenemos pocos puntos (antes eran genes, ahora son tipos celulares), así que no estimaremos una curva, por eso usamos `abundance.trend = FALSE`
+
+```{r}
+fit.ab <- glmQLFit(y.ab, design, robust = TRUE, abundance.trend = FALSE)
+summary(fit.ab$var.prior)
+plotQLDisp(fit.ab, cex = 1)
+```
+
+* Corremos el análisis
+
+```{r}
+res <- glmQLFTest(fit.ab, coef = ncol(design))
+summary(decideTests(res))
+topTags(res)
+```
+
+* Entre los tipos celulares donde teníamos suficiente información, solo 2 muestran diferencias en sus niveles de frecuencia entre las muestras con y sin inyecciones de td-Tomato.
+
+## Comentarios sobre la interpretación
+
+
+* 👉 La distinción entre ambos tipos de análisis en scRNA-seq es articial
+ 
+* Las etiquetas que usamos para el análisis de abundancia están definidas por los niveles de expresión de los genes
+
+* Este tema de cuantas veces usas los datos y como eso afecta las pruebas estadísticas que usamos es un tema de investigación actual
+
+<blockquote class="twitter-tweet"><p lang="en" dir="ltr">In a talk that was as clear as her book &quot;intro to stat learning&quot;, today&#39;s <a href="https://twitter.com/hashtag/bioc2021?src=hash&amp;ref_src=twsrc%5Etfw">#bioc2021</a> keynote <a href="https://twitter.com/daniela_witten?ref_src=twsrc%5Etfw">@daniela_witten</a> showed how double dipping (e.g. using genes to cluster data and then testing for DE between clusters) leads to + type 1 error and an intuitive method to correct this prob.</p>&mdash; Alejandro Reyes (@areyesq) <a href="https://twitter.com/areyesq/status/1423006233968140292?ref_src=twsrc%5Etfw">August 4, 2021</a></blockquote> <script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
+
+* Les recomiendo que lean detenidamente esa parte en [OSCA](https://bioconductor.org/books/release/OSCA/multi-sample-comparisons.html#comments-on-interpretation)
+
+
+## Detalles de la sesión de R
+
+```{r}
+## Información de la sesión de R
+Sys.time()
+proc.time()
+options(width = 120)
+sessioninfo::session_info()
+```
+
+## Patrocinadores {-}
+
+Agradecemos a nuestros patrocinadores:
+
+<a href="https://comunidadbioinfo.github.io/es/post/cs_and_s_event_fund_award/#.YJH-wbVKj8A"><img src="https://comunidadbioinfo.github.io/post/2021-01-27-cs_and_s_event_fund_award/spanish_cs_and_s_award.jpeg" width="400px" align="center"/></a>
+
+<a href="https://www.r-consortium.org/"><img src="https://www.r-consortium.org/wp-content/uploads/sites/13/2016/09/RConsortium_Horizontal_Pantone.png" width="400px" align="center"/></a>
