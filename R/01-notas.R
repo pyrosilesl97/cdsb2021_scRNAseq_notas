@@ -24,7 +24,8 @@ library('gh')
 #Revisar la configuración de Git
 gh::gh_whoami() # para checar cómo quedó la configuración
 
-gert::git_commit_all("Nuevos")
+gert::git_add()
+gert::git_commit_all("12 agregado")
 gert::git_push()
 
 usethis::use_r('08_reduccion_de_dimensiones.R')
