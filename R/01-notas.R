@@ -27,7 +27,7 @@ gh::gh_whoami() # para checar cómo quedó la configuración
 gert::git_commit_all("Nuevos")
 gert::git_push()
 
-usethis::use_r('08_reduccion_de_dimensiones.Rmd')
+usethis::use_r('08_reduccion_de_dimensiones.R')
 
 ##Change the error
 #options(error= function() starwarssay::say("Do or do not... There is no try", by = "baby_yoda"))
